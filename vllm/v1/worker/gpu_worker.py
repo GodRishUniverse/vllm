@@ -1054,7 +1054,16 @@ class Worker(WorkerBase):
 
             logger.info(msg)
 
-            maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
+            # Save the KV cache size this boot actually allocated, so that a
+            # later boot that reuses the plan (VLLM_ENABLE_STARTUP_PLAN=1)
+            # gets the same KV cache. Do not save the suggestion printed
+            # above: it subtracts the CUDA graph memory twice (once as the
+            # estimate inside peak_activation_memory, once as the measured
+            # cuda_graph_memory_bytes) and also subtracts the 150 MiB buffer,
+            # so every reused boot would get a smaller KV cache than this one.
+            # This boot already reserved room for the graphs and they fit, so
+            # its own number is a size known to work on this device.
+            maybe_save_startup_plan(self, int(self.available_kv_cache_memory_bytes))
 
         if not self.use_v2_model_runner and get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
