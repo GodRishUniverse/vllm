@@ -904,23 +904,48 @@ def graph_pool_bytes(pool: Any) -> int | None:
     )
 
 
+def _process_and_reserved_bytes(device: torch.device) -> tuple[int, int] | None:
+    """Return (bytes this process holds on ``device`` per the platform's
+    per-process counter, torch reserved bytes on ``device``).
+
+    Torch "reserved" is the caching allocator's footprint (live tensors plus
+    cached free blocks), all of it this process's device memory. Returns
+    ``None`` if the platform has no counter, or if the counter reads below
+    reserved: such a reading cannot be this process's memory, so the caller
+    treats the counter as unavailable.
+    """
+    used = current_platform.get_process_device_memory_bytes(device)
+    reserved = torch.accelerator.memory_reserved(device)
+    return None if used is None or used < reserved else (used, reserved)
+
+
 @torch.inference_mode()
 def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
 
-    Called during memory profiling, *before* the real KV cache is allocated,
-    so that ``Worker.determine_available_memory`` can reserve headroom for
-    graph capture. Bootstraps a minimal KV cache, runs ``capture_model()``
-    once into a throwaway graph pool, then releases everything so the real
-    init/capture path starts clean.
+    Called during memory profiling, after the profile run's memory is
+    measured and *before* the real KV cache is allocated, so that
+    ``Worker.determine_available_memory`` can reserve headroom for graph
+    capture. Bootstraps a minimal KV cache, runs ``capture_model()`` once
+    into a throwaway graph pool (the profiling capture), then releases
+    everything so the real init/capture path starts clean.
 
-    The estimate is the size of the throwaway pool after the capture plus
-    what the profiling pass still holds after teardown: first-use
-    allocations outside the pool (kernel workspaces, communicator buffers)
-    that the profile run before this did not make and that the real capture
-    no longer pays for. The free-memory delta of the capture itself is only
-    a fallback: it also counts transients the allocator caches. Every
-    descriptor is captured; FULL graphs bake in the profiling KV cache
+    The estimate is the sum of:
+
+    - the throwaway pool's size after the capture: the allocator memory
+      that holds the graphs' tensors;
+    - "retained": what the profiling pass still holds after teardown, i.e.
+      first-use allocations outside the pool (kernel workspaces,
+      communicator buffers). The real capture no longer pays for them, but
+      they were made after the profile run was measured, so they are
+      reserved here;
+    - where the platform counts this process's device memory (ROCm), the
+      graph memory the GPU runtime allocates outside torch. "Retained" is
+      then read from that counter too.
+
+    The capture's free-memory delta is only a fallback: it also counts
+    transients the allocator caches. Every descriptor is captured; FULL
+    graphs bake in the profiling KV cache
     pointers, so all profiling captures are discarded afterwards: replaying
     graphs recorded against the throwaway profiling state is unsafe (e.g.
     inductor graph partition reclaims the storages of earlier cudagraph
@@ -933,6 +958,9 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     gc.collect()
     torch.accelerator.empty_cache()
     free_before = torch.accelerator.get_memory_info()[0]
+    # Per-process counter readings: (counter bytes, torch reserved bytes),
+    # or None without a usable counter. See _process_and_reserved_bytes.
+    proc_before = _process_and_reserved_bytes(runner.device)
 
     # Run the whole profiling phase against a throwaway CUDA graph pool by
     # pointing the global graph pool singleton at it: objects that bind the
@@ -983,8 +1011,11 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
                     if isinstance(value, CudaGraphManager)
                 ]
 
+            proc_start = _process_and_reserved_bytes(runner.device)
             with capture_outside_cumem_pool():
                 measured = int(runner.capture_model(profile_only=True))
+            # Read again while every profiling graph is still alive.
+            proc_live = _process_and_reserved_bytes(runner.device)
             pool_bytes = graph_pool_bytes(throwaway_pool)
         finally:
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
@@ -1007,20 +1038,61 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         platform_cls._global_graph_pool = saved_global_pool
 
     retained = max(free_before - torch.accelerator.get_memory_info()[0], 0)
+    proc_after = _process_and_reserved_bytes(runner.device)
+    runtime_bytes = 0
     if pool_bytes is None:
         # No allocator snapshot: the free-memory delta stands in, and it
         # already includes what the pass retained.
         estimate, retained = measured, 0
+    elif (
+        proc_before is not None
+        and proc_start is not None
+        and proc_live is not None
+        and proc_after is not None
+    ):
+        # Graphs also hold memory the GPU runtime allocates outside torch
+        # (ROCm: kernel-argument buffers, which hold the arguments of each
+        # kernel in a graph): the counter's growth across the capture minus
+        # torch reserved's growth, read while the graphs are alive. The
+        # counter also gives "retained", as ROCm's free memory is inexact
+        # (see RocmPlatform.get_process_device_memory_bytes).
+        # Error budget, measured on Llama-3.1-8B TP1 and Gemma-4-31B TP4 on
+        # an R9700:
+        # - counted twice: runtime allocations made in the capture and kept
+        #   after teardown are in both terms (+0.15 / +0.11 GiB per GPU);
+        # - missed: the real capture's runtime memory exceeds the part the
+        #   profiling graphs freed (-0.11 / -0.15 GiB per GPU), and the
+        #   counter misses the save area of any hardware queue the capture
+        #   creates (-0.03 GiB for the one queue seen on Llama);
+        # - net: +0.02 GiB on Llama, -0.035 GiB per GPU on Gemma.
+        counter_growth = proc_live[0] - proc_start[0]
+        reserved_growth = proc_live[1] - proc_start[1]
+        runtime_bytes = max(counter_growth - reserved_growth, 0)
+        retained = max(proc_after[0] - proc_before[0], 0)
+        estimate = pool_bytes + runtime_bytes + retained
+    elif current_platform.is_rocm():
+        # ROCm without the counter: the pool misses the runtime's graph
+        # memory. The capture's free-memory delta includes it (rounded up)
+        # along with the pool, so it is a floor for the estimate.
+        estimate = max(pool_bytes + retained, measured)
     else:
         estimate = pool_bytes + retained
-    runner.cudagraph_profiling_retained_bytes = retained
+    # The non-pool part of the estimate (retained plus the runtime term, or
+    # the ROCm floor's excess over the pool; 0 without a pool snapshot),
+    # despite the name. The worker subtracts it to compare the estimated
+    # pool with the real capture's pool.
+    runner.cudagraph_profiling_retained_bytes = (
+        0 if pool_bytes is None else estimate - pool_bytes
+    )
     logger.info(
         "CUDA graph memory estimate: %.2f GiB (graph pool %s GiB, %.2f GiB "
-        "retained by the profiling pass outside the pool; the profiling "
-        "capture's free-memory delta was %.2f GiB).",
+        "retained by the profiling pass outside the pool, %.2f GiB GPU "
+        "runtime graph memory outside the pool; the profiling capture's "
+        "free-memory delta was %.2f GiB).",
         estimate / GiB_bytes,
         "n/a" if pool_bytes is None else f"{pool_bytes / GiB_bytes:.2f}",
         retained / GiB_bytes,
+        runtime_bytes / GiB_bytes,
         measured / GiB_bytes,
     )
     return estimate

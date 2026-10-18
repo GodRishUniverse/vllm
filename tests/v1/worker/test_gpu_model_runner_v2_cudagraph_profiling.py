@@ -61,6 +61,7 @@ def _make_profiling_runner(
         needs_capture, num_full_descs, piecewise_only
     )
     runner.vllm_config = SimpleNamespace()
+    runner.device = torch.device("cpu")
 
     events: list[str] = []
     runner.events = events
@@ -93,6 +94,16 @@ class _FakePlatform:
     def get_global_graph_pool(self) -> Any:
         return type(self)._global_graph_pool
 
+    # Per-process device memory counter: none by default (CUDA behaviour).
+    process_memory: list[int] | None = None
+    rocm = False
+
+    def get_process_device_memory_bytes(self, device: Any) -> int | None:
+        return None if self.process_memory is None else self.process_memory.pop(0)
+
+    def is_rocm(self) -> bool:
+        return self.rocm
+
 
 def _patch_module(monkeypatch) -> None:
     @contextlib.contextmanager
@@ -100,6 +111,9 @@ def _patch_module(monkeypatch) -> None:
         yield
 
     _FakePlatform._global_graph_pool = GLOBAL_POOL
+    _FakePlatform.process_memory = None
+    _FakePlatform.rocm = False
+    monkeypatch.setattr(cgu.torch.accelerator, "memory_reserved", lambda *_: 0)
     monkeypatch.setattr(cgu, "set_current_vllm_config", _fake_set_current_vllm_config)
     monkeypatch.setattr(cgu, "current_platform", _FakePlatform())
     monkeypatch.setattr(
@@ -168,6 +182,64 @@ def test_profile_cudagraph_memory_measures_pool_and_retained(monkeypatch):
     assert runner.events == ["init", "capture", "teardown"]
     # Capture must use a throwaway pool, not the persistent global pool.
     assert runner.cudagraph_manager.pool == THROWAWAY_POOL
+
+
+def _patch_pool_and_free_memory(monkeypatch, retained_by_free_memory: int) -> None:
+    mib = 1 << 20
+    monkeypatch.setattr(cgu, "graph_pool_bytes", lambda pool: 300 * mib)
+    free_memory = iter([10 << 30, (10 << 30) - retained_by_free_memory])
+    monkeypatch.setattr(
+        cgu.torch.accelerator, "get_memory_info", lambda: (next(free_memory), 1 << 40)
+    )
+
+
+def test_profile_cudagraph_memory_adds_runtime_term_from_counter(monkeypatch):
+    """With a per-process counter, the estimate is pool + the runtime's graph
+    memory outside torch + retained, all measured with the counter."""
+    _patch_module(monkeypatch)
+    mib = 1 << 20
+    runner = _make_profiling_runner(CUDAGraphMode.FULL, captured_bytes=3000 * mib)
+    # Free memory claims 60 MiB retained (2 MiB rounding); the counter, 20.
+    _patch_pool_and_free_memory(monkeypatch, 60 * mib)
+    # Counter readings: before, capture start, graphs alive, after teardown.
+    _FakePlatform.process_memory = [1000 * mib, 1100 * mib, 1500 * mib, 1020 * mib]
+    # Torch reserved at the same points: the pool grew by 300 MiB.
+    reserved = iter([100 * mib, 200 * mib, 500 * mib, 120 * mib])
+    monkeypatch.setattr(
+        cgu.torch.accelerator, "memory_reserved", lambda *_: next(reserved)
+    )
+
+    result = cgu.profile_cudagraph_memory(runner)
+
+    # Runtime term: (1500 - 1100) - (500 - 200) = 100 MiB.
+    assert result == (300 + 100 + 20) * mib
+    assert runner.cudagraph_profiling_retained_bytes == (100 + 20) * mib
+
+
+def test_profile_cudagraph_memory_rocm_without_counter_keeps_delta(monkeypatch):
+    """ROCm without the counter: the pool misses the runtime's graph memory,
+    so the free-memory delta of the capture stays the lower bound."""
+    _patch_module(monkeypatch)
+    _FakePlatform.rocm = True
+    mib = 1 << 20
+    runner = _make_profiling_runner(CUDAGraphMode.FULL, captured_bytes=3000 * mib)
+    _patch_pool_and_free_memory(monkeypatch, 60 * mib)
+
+    assert cgu.profile_cudagraph_memory(runner) == 3000 * mib
+
+
+def test_profile_cudagraph_memory_ignores_counter_below_reserved(monkeypatch):
+    """A counter reading below torch's reserved memory is not this process's
+    and is ignored. Off ROCm that gives the pool + retained estimate (here);
+    on ROCm it gives the free-memory floor, as without a counter."""
+    _patch_module(monkeypatch)
+    mib = 1 << 20
+    runner = _make_profiling_runner(CUDAGraphMode.FULL, captured_bytes=3000 * mib)
+    _patch_pool_and_free_memory(monkeypatch, 60 * mib)
+    _FakePlatform.process_memory = [10 * mib] * 4
+    monkeypatch.setattr(cgu.torch.accelerator, "memory_reserved", lambda *_: 100 * mib)
+
+    assert cgu.profile_cudagraph_memory(runner) == (300 + 60) * mib
 
 
 def test_profile_cudagraph_memory_captures_every_full_graph(monkeypatch):

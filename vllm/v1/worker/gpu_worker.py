@@ -989,8 +989,8 @@ class Worker(WorkerBase):
             diff = abs(actual - estimated)
             logger.info(
                 "CUDA graph pool memory: %s GiB (actual), %s GiB (estimated), "
-                "difference: %s GiB (%.1f%%); %s GiB retained by the profiling "
-                "pass was reserved on top of the estimate.",
+                "difference: %s GiB (%.1f%%); the non-pool part of the estimate, "
+                "%s GiB, was reserved in addition to the pool estimate.",
                 GiB(actual),
                 GiB(estimated),
                 GiB(diff),
