@@ -1087,6 +1087,41 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        if (
+            self.use_v2_model_runner
+            and get_pp_group().is_last_rank
+            and not self.model_runner.is_pooling_model
+        ):
+            # MRV2 counterpart of the V1 block above. The sampler allocates a
+            # [num_reqs, vocab] FP32 copy of the logits on every step. Its size
+            # follows the batch size, so while a server ramps up, each new
+            # largest batch needs a block bigger than any PyTorch has cached;
+            # PyTorch then reserves a new GPU segment and keeps the old, smaller
+            # ones (PyTorch only returns cached memory when an allocation fails).
+            # Measured on Qwen3-4B (max_num_seqs=256) on a 32 GB GPU: 22 such
+            # segments, +2.19 GiB, none of it in the KV cache budget.
+            # warmup_kernels() already ran the sampler at this size, but
+            # capture_model() then called empty_cache(), which released that
+            # block.
+            # Run the sampler once more at the largest batch, after capture, so
+            # PyTorch keeps one block of the largest size and later, smaller
+            # steps are carved out of it instead of reserving new segments. The
+            # same size was charged to the KV budget in profile_run().
+            max_num_reqs = min(
+                self.scheduler_config.max_num_seqs,
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            # Only the shape matters; _dummy_sampler_run() fills in random
+            # values and computes the logits from these hidden states.
+            hidden_states = torch.empty(
+                max_num_reqs,
+                self.model_config.get_hidden_size(),
+                dtype=self.model_config.dtype,
+                device=self.device,
+            )
+            self.model_runner._dummy_sampler_run(hidden_states=hidden_states)
+            del hidden_states
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(

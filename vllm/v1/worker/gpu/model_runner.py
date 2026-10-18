@@ -985,16 +985,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
+        # Dummy forward passes can leave inf/NaN in the hidden states. Use random
+        # values instead so the top-k/top-p kernels below see ordinary logits
+        # (the V1 runner does the same).
+        hidden_states = torch.rand_like(hidden_states)
         logits = self.model.compute_logits(hidden_states)
         dummy_input_batch = InputBatch.make_dummy(
             num_reqs, num_reqs, self.input_buffers
         )
-
-        # NOTE(woosuk): During the initial memory profiling, the sampler may skip
-        # top_k, top_p, and logprobs, using less GPU memory than what is possible
-        # during actual execution.
         assert self.sampler is not None
-        self.sampler(logits, dummy_input_batch)
+
+        # The dummy batch uses request slots 0..num_reqs-1, and no real request
+        # is registered there, so by default the sampler treats them as plain
+        # sampling and skips its most memory-hungry steps: the FP32 copy of the
+        # whole [num_reqs, vocab] logits tensor, temperature, and top-k/top-p
+        # (which also allocates its own [num_SMs, vocab] work buffer). A real
+        # server with e.g. temperature=0.7/top_k=20/top_p=0.8 (Qwen3's default
+        # generation config) runs all of them on every step.
+        # Give the dummy slots such sampling settings for this one call, so
+        # that (1) during profile_run() this memory is part of the measured
+        # peak and is subtracted from the KV cache budget, and (2) during the
+        # post-capture warm-up it is left in PyTorch's cache as one block of
+        # the largest size (see compile_or_warm_up_model in gpu_worker.py).
+        # The values mirror the V1 runner's dummy sampling metadata.
+        states = self.sampler.sampling_states
+        needs_processing = self.sampler.needs_logits_processing
+        # Remember the current per-slot settings so they can be put back.
+        saved = (
+            states.temperature.np[:num_reqs].copy(),
+            states.top_k.np[:num_reqs].copy(),
+            states.top_p.np[:num_reqs].copy(),
+            needs_processing[:num_reqs].copy(),
+        )
+        try:
+            states.temperature.np[:num_reqs] = 0.5
+            # vocab - 1 is the largest top-k that is still "active".
+            states.top_k.np[:num_reqs] = states.vocab_size - 1
+            states.top_p.np[:num_reqs] = 0.9
+            # Make apply_sampling_params() take the FP32 copy path.
+            needs_processing[:num_reqs] = True
+            # Publish the new values to the GPU-visible copies.
+            states.temperature.copy_to_uva()
+            states.top_k.copy_to_uva()
+            states.top_p.copy_to_uva()
+            self.sampler(logits, dummy_input_batch)
+        finally:
+            # Restore the slots exactly as they were before this call.
+            (
+                states.temperature.np[:num_reqs],
+                states.top_k.np[:num_reqs],
+                states.top_p.np[:num_reqs],
+                needs_processing[:num_reqs],
+            ) = saved
+            states.temperature.copy_to_uva()
+            states.top_k.copy_to_uva()
+            states.top_p.copy_to_uva()
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
